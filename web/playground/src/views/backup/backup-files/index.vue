@@ -577,16 +577,16 @@ function handleBatchDelete() {
 const gridOptions: VxeTableGridOptions<RowType> = {
   checkboxConfig: {
     highlight: true,
-    labelField: 'dirName',
   },
   columns: [
     { title: $t('page.backup.backupFilesPage.seq'), type: 'seq', width: 60 },
     {
-      align: 'left',
+      align: 'center',
       fixed: 'left',
-      title: $t('page.backup.backupFilesPage.selectColumn'),
+      // 留空：checkbox 列表头默认自带全选复选框，无需再写文字标题（否则窄列内换行）
+      title: '',
       type: 'checkbox',
-      width: 48,
+      width: 50,
     },
     {
       field: 'database',
@@ -989,6 +989,7 @@ onBeforeUnmount(() => {
     <Grid :table-title="$t('page.backup.backupFilesPage.gridTableTitle')">
       <template #toolbar-tools>
         <Button
+          class="mr-2"
           danger
           :disabled="selectedRowKeys.length === 0"
           @click="handleBatchDelete"

@@ -61,7 +61,6 @@
       "keywordPlaceholder": "Database name / Directory name / Path",
 
       "seq": "No.",
-      "selectColumn": "Select",
       "databaseName": "Database Name",
       "dirName": "Directory Name",
       "backupTime": "Backup Time",

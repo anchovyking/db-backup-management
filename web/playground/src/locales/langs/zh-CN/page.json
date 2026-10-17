@@ -62,7 +62,6 @@
       "keywordPlaceholder": "数据库名 / 目录名 / 路径",
 
       "seq": "序号",
-      "selectColumn": "选择",
       "databaseName": "数据库名",
       "dirName": "目录名",
       "backupTime": "备份时间",
