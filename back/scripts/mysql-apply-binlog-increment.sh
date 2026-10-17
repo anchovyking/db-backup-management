@@ -51,7 +51,8 @@ export MYSQL_PWD="${DB_PASS}"
 for sql in "${SQL_FILES[@]}"; do
   # 防呆：若文件是 mysqlbinlog -v/DECODE-ROWS 生成的“注释可读格式”，
   # mysql 执行会成功但不会真正变更数据。此处直接报错，避免静默失败。
-  if rg -n "^### " "${sql}" >/dev/null 2>&1 && ! rg -n "^BINLOG '" "${sql}" >/dev/null 2>&1; then
+  # 用 grep 而非 rg，避免依赖非标准工具（镜像内不保证存在 rg）。
+  if grep -qn "^### " "${sql}" 2>/dev/null && ! grep -qn "^BINLOG '" "${sql}" 2>/dev/null; then
     echo "错误: 检测到不可回放的 binlog 文件格式（仅含 ### 注释，无 BINLOG 事件）: ${sql}"
     echo "请重新执行一次增量备份（使用已修复的导出脚本）后再还原。"
     exit 1
