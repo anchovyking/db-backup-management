@@ -2220,6 +2220,10 @@ def _start_backup_for_instance(instance: dict, payload: dict) -> tuple[bool, Any
             "--session-dir",
             full_path,
         ]
+        # 把本次全量的 ID 传给脚本写入 meta，供 CLEAN_DAYS 清理时连带删除其关联增量
+        full_own_file_id = str(pending.get("backup_file_id") or "").strip()
+        if full_own_file_id:
+            cmd.extend(["--backup-file-id", full_own_file_id])
         if tables:
             cmd.extend(["-t", tables])
         if ignore_tables:

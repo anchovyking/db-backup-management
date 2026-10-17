@@ -209,10 +209,11 @@ show_usage() {
   echo "  -d, --database    数据库名"
   echo "  -b, --backup-dir  备份根目录（最终目录为 \${BACKUP_ROOT}/\${DB_NAME}_时间戳）"
   echo "      --session-dir  指定本次会话目录绝对路径（须位于 -b 根目录下；与自动时间戳二选一，供服务端预登记）"
+  echo "      --backup-file-id  本次备份文件 ID（写入 meta/backup-options.json；清理旧备份时据此连带删除关联增量）"
   echo "  -t, --tables      仅备份指定表，逗号分隔"
   echo "  -i, --ignore      不备份的表，逗号分隔；仅 -i 时使用 mydumper --omit-from-file"
   echo "      --ignore-engines 忽略的存储引擎列表，逗号分隔（传给 mydumper --ignore-engines）"
-  echo "  -c, --clean       备份完成后清理 N 天前的同库备份目录（名称前缀 \${DB_NAME}_）"
+  echo "  -c, --clean       备份完成后清理 N 天前的同库全量目录，并连带清理其关联增量（名称前缀 \${DB_NAME}_）"
   echo "      --threads     mydumper 线程数（默认 ${THREADS}）"
   echo "      --max-threads-per-table  单表并行线程上限（默认 ${MAX_THREADS_PER_TABLE}，建议保持 1 避免 file already open）"
   echo "      --compress    压缩算法，如 zstd（默认 ${COMPRESS}）；设为 none 可关闭压缩（若版本支持）"
@@ -227,6 +228,7 @@ CLEAN_DAYS=""
 TABLES_INCLUDE=""
 TABLES_EXCLUDE=""
 SESSION_DIR=""
+BACKUP_FILE_ID=""
 while [ $# -gt 0 ]; do
   case "${1}" in
     -h | --help)
@@ -301,6 +303,10 @@ while [ $# -gt 0 ]; do
     --session-dir)
       [ -n "${2:-}" ] || { echo "错误: --session-dir 需要参数"; exit 1; }
       SESSION_DIR="${2}"
+      shift 2
+      ;;
+    --backup-file-id)
+      BACKUP_FILE_ID="${2:-}"
       shift 2
       ;;
     *)
@@ -410,9 +416,10 @@ if [ -z "${TABLES_FINAL}" ]; then
 fi
 
 _esc_json() { echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-printf '{\n  "tables_include": "%s",\n  "tables_exclude": "%s",\n  "tool": "mydumper"\n}\n' \
+printf '{\n  "tables_include": "%s",\n  "tables_exclude": "%s",\n  "backup_file_id": "%s",\n  "tool": "mydumper"\n}\n' \
   "$(_esc_json "${TABLES_INCLUDE:-}")" \
   "$(_esc_json "${TABLES_EXCLUDE:-}")" \
+  "$(_esc_json "${BACKUP_FILE_ID:-}")" \
   >"${BACKUP_DIR}/meta/backup-options.json"
 
 # mydumper 官方参数为 --tables-list，格式：db.t1,db.t2（见 mydumper_usage.html）
@@ -593,16 +600,42 @@ echo "  说明: 结构与数据一般为独立 .sql.zst（取决于 mydumper 版
 
 if [ -n "${CLEAN_DAYS}" ] && [ "${CLEAN_DAYS}" -gt 0 ] 2>/dev/null; then
   MINUTES_AGO=$((CLEAN_DAYS * 24 * 60))
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 清理 ${DB_NAME} 的 ${CLEAN_DAYS} 天前备份（目录名 ${DB_NAME}_*）..."
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 清理 ${DB_NAME} 的 ${CLEAN_DAYS} 天前全量备份（目录名 ${DB_NAME}_*），并连带清理关联增量..."
   DELETED=0
+
+  # 全量目录的备份 ID：写在 meta/backup-options.json（旧备份可能没有，则只能删自身）
+  _read_backup_file_id() {
+    sed -n 's/.*"backup_file_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "$1/meta/backup-options.json" 2>/dev/null | head -n 1
+  }
+  # 增量目录所属全量的 ID：写在 meta/increment-info.json
+  _read_full_id_of_increment() {
+    sed -n 's/.*"full_backup_file_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "$1/meta/increment-info.json" 2>/dev/null | head -n 1
+  }
+
+  # 1) 删超期全量，并连带删其关联增量：增量失去基线后无法还原，留着只会占空间
+  #    注：本次改动之前创建的全量目录其 meta 无 backup_file_id，此时退化为「只删全量」
   while IFS= read -r old_dir; do
     [ -z "${old_dir}" ] || [ ! -d "${old_dir}" ] && continue
     # 不删除当前本次目录
     [ "${old_dir}" = "${BACKUP_DIR}" ] && continue
+    FULL_ID="$(_read_backup_file_id "${old_dir}")"
     rm -rf "${old_dir}"
-    echo "  -> 已删除: ${old_dir}"
+    echo "  -> 已删除全量: ${old_dir}"
     DELETED=$((DELETED + 1))
-  done < <(find "${BACKUP_ROOT}" -maxdepth 1 -mindepth 1 -type d -name "${DB_NAME}_*" -mmin +"${MINUTES_AGO}" 2>/dev/null)
+    if [ -n "${FULL_ID}" ]; then
+      while IFS= read -r inc_dir; do
+        [ -z "${inc_dir}" ] || [ ! -d "${inc_dir}" ] && continue
+        if [ "$(_read_full_id_of_increment "${inc_dir}")" = "${FULL_ID}" ]; then
+          rm -rf "${inc_dir}"
+          echo "  -> 已删除关联增量: ${inc_dir}"
+          DELETED=$((DELETED + 1))
+        fi
+      done < <(find "${BACKUP_ROOT}" -maxdepth 1 -mindepth 1 -type d -name "${DB_NAME}_inc_*" 2>/dev/null)
+    fi
+  done < <(find "${BACKUP_ROOT}" -maxdepth 1 -mindepth 1 -type d -name "${DB_NAME}_*" ! -name "${DB_NAME}_inc_*" -mmin +"${MINUTES_AGO}" 2>/dev/null)
+
   [ "${DELETED}" -eq 0 ] && echo "  (无满足条件的旧备份)"
 fi
 
