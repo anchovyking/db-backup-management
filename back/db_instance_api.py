@@ -26,6 +26,9 @@ Authorization: Bearer <accessToken>（登录接口除外）。
 备份文件
 - GET    /api/backup-files                    列表（可选 query keyword）
 - DELETE /api/backup-files/<dirName>         删除记录并删除已解析且路径安全的会话备份目录（磁盘上不存在则仅删记录）
+- POST   /api/backup-files/batch-delete      批量删除：body {dirNames: [...], cascade: true}；
+                                             逐条返回 deleted / failed 明细，单条失败不阻断其余条目；
+                                             cascade 为 true 时删除全量会连带删除其关联增量备份
 - GET    /api/backup-files/<dirName>/download  下载 backupDir 目录打包的 tar.gz
 - GET    /api/backup-files/<dirName>/tables   解析 metadata（data/metadata、.partial 及旧版根目录）；目录解析支持 back/backup/<dirName> 回退
 - GET    /api/backup-files/<dirName>/logs     读取会话目录下 backup.log、restore.log 文本（有长度上限）
@@ -275,8 +278,13 @@ def _success(data: Any = None, message: str = "success"):
     return jsonify({"code": 0, "data": data, "message": message})
 
 
-def _error(message: str = "error", code: int = 1, http_status: int = 400):
-    return jsonify({"code": code, "data": None, "message": message}), http_status
+def _error(
+    message: str = "error",
+    code: int = 1,
+    http_status: int = 400,
+    data: Any = None,
+):
+    return jsonify({"code": code, "data": data, "message": message}), http_status
 
 
 # 需登录才可访问的业务前缀（备份相关）
@@ -3117,65 +3125,251 @@ def list_backup_files():
     return _success(items)
 
 
+def _delete_backup_dir_on_disk(
+    item: dict,
+    dir_name: str,
+) -> tuple[bool, str, bool, Optional[str]]:
+    """
+    删除单条备份记录对应的磁盘会话目录。
+    返回 (ok, error, removed_disk, resolved)：
+    - 目录解析不到（磁盘上已不存在 / 路径不合法）：ok=True, removed_disk=False —— 仅删记录；
+    - 目录存在但不在允许根下：ok=False，调用方不应删除记录；
+    - rmtree 失败：ok=False，调用方不应删除记录。
+    """
+    backup_dir = (item.get("backupDir") or "").strip()
+    if not backup_dir:
+        return True, "", False, None
+
+    resolved, _rerr = _resolve_existing_backup_dir(backup_dir, dir_name)
+    if not resolved:
+        # 磁盘上已无该目录：仅删除记录（与历史行为一致）
+        return True, "", False, None
+    if not _is_backup_dir_safe_to_download(resolved):
+        return False, "备份目录不在允许删除的路径下", False, resolved
+    try:
+        shutil.rmtree(resolved)
+    except OSError as exc:
+        return False, f"删除备份目录失败: {exc}", False, resolved
+    return True, "", True, resolved
+
+
+def _collect_cascade_increment_items(
+    items: list[dict],
+    targets: list[dict],
+    account_id: str,
+) -> list[dict]:
+    """
+    收集 targets（全量备份）所关联的增量备份记录，用于级联删除。
+    仅取同账号、backup_type=increment 且 full_backup_file_id 命中 targets 的记录，
+    并排除已被显式选中或已收集的目录（避免重复删除）。
+    """
+    full_ids = {
+        (t.get("backup_file_id") or "").strip()
+        for t in targets
+        if (t.get("backup_file_id") or "").strip()
+    }
+    if not full_ids:
+        return []
+    selected = {(t.get("dirName") or "").strip() for t in targets}
+    out: list[dict] = []
+    for x in items:
+        if (x.get("account_id") or "").strip() != (account_id or "").strip():
+            continue
+        if (x.get("backup_type") or "").strip().lower() != "increment":
+            continue
+        if (x.get("full_backup_file_id") or "").strip() not in full_ids:
+            continue
+        dn = (x.get("dirName") or "").strip()
+        if not dn or dn in selected:
+            continue
+        out.append(x)
+        selected.add(dn)
+    return out
+
+
+def _execute_backup_file_deletions(
+    targets: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """
+    逐条删除 targets 的磁盘目录，最后把成功删除的记录从 backup-files.json 中一次性移除。
+    单条失败不阻断其余条目；返回 (deleted, failed)，每项含 dirName（failed 另含 error）。
+    """
+    deleted: list[dict] = []
+    failed: list[dict] = []
+    removed_dir_names: set[str] = set()
+
+    for t in targets:
+        dn = (t.get("dirName") or "").strip()
+        ok, err, removed_disk, resolved = _delete_backup_dir_on_disk(t, dn)
+        if not ok:
+            failed.append({"dirName": dn, "error": err})
+            continue
+        entry: dict[str, Any] = {"dirName": dn, "removed_disk": removed_disk}
+        if resolved:
+            entry["resolved_path"] = resolved
+        deleted.append(entry)
+        removed_dir_names.add(dn)
+
+    if removed_dir_names:
+        with _file_lock:
+            current = _load_backup_files()
+            before = len(current)
+            current = [
+                x
+                for x in current
+                if (x.get("dirName") or "").strip() not in removed_dir_names
+            ]
+            if len(current) != before:
+                _save_backup_files(current)
+
+    return deleted, failed
+
+
 @app.route("/api/backup-files/<path:dir_name>", methods=["DELETE"])
 def delete_backup_file(dir_name: str):
+    """删除单条备份记录及其磁盘目录；若是全量备份，同时级联删除其关联的增量备份。"""
     dir_name = unquote(dir_name).strip()
     if not dir_name:
         return _error("dirName 无效")
 
-    with _file_lock:
-        items = _load_backup_files()
-        raw_target = next(
-            (x for x in items if (x.get("dirName") or "").strip() == dir_name),
-            None,
-        )
-    if not raw_target:
-        return _error("记录不存在", http_status=404)
-
-    target = _normalize_backup_file(raw_target)
     current_account_id = _get_current_account_id()
+    with _file_lock:
+        items = [_normalize_backup_file(x) for x in _load_backup_files()]
+
+    target = next(
+        (x for x in items if (x.get("dirName") or "").strip() == dir_name),
+        None,
+    )
+    if not target:
+        return _error("记录不存在", http_status=404)
     if (target.get("account_id") or "").strip() != (current_account_id or "").strip():
         return _error("记录不存在", http_status=404)
 
-    backup_dir = (target.get("backupDir") or "").strip()
+    cascade_targets = _collect_cascade_increment_items(
+        items, [target], current_account_id or ""
+    )
+    deleted, failed = _execute_backup_file_deletions([target] + cascade_targets)
 
-    removed_disk = False
-    resolved: Optional[str] = None
-    if backup_dir:
-        resolved, _rerr = _resolve_existing_backup_dir(backup_dir, dir_name)
-        if resolved:
-            if not _is_backup_dir_safe_to_download(resolved):
-                return _error("备份目录不在允许删除的路径下", http_status=403)
-            try:
-                shutil.rmtree(resolved)
-                removed_disk = True
-            except OSError as exc:
-                return _error(f"删除备份目录失败: {exc}", http_status=500)
+    target_failed = next((f for f in failed if f["dirName"] == dir_name), None)
+    if target_failed is not None:
+        status = 403 if "不在允许" in target_failed["error"] else 500
+        return _error(target_failed["error"], http_status=status)
 
-    with _file_lock:
-        items = _load_backup_files()
-        before = len(items)
-        items = [
-            x
-            for x in items
-            if (x.get("dirName") or "").strip() != dir_name
-        ]
-        if len(items) == before:
-            return _error("记录不存在", http_status=404)
-        _save_backup_files(items)
+    main = next((d for d in deleted if d["dirName"] == dir_name), {})
+    removed_disk = bool(main.get("removed_disk"))
+    cascaded = [d["dirName"] for d in deleted if d["dirName"] != dir_name]
 
     if removed_disk:
         msg = "已删除备份记录及磁盘上的备份目录"
     else:
         msg = "已删除备份记录（磁盘上未找到对应目录，未删除文件）"
+    if cascaded:
+        msg += f"，并级联删除 {len(cascaded)} 个关联增量备份"
 
     out: dict[str, Any] = {
         "dirName": dir_name,
         "removed_disk": removed_disk,
+        "cascaded": cascaded,
     }
-    if resolved:
-        out["resolved_path"] = resolved
+    if main.get("resolved_path"):
+        out["resolved_path"] = main["resolved_path"]
     return _success(out, msg)
+
+
+@app.route("/api/backup-files/batch-delete", methods=["POST"])
+def batch_delete_backup_files():
+    """
+    批量删除备份记录：请求体 {"dirNames": ["目录名", ...], "cascade": true}。
+    - 仅处理当前登录账号的记录，越权/不存在的条目计入 failed，不影响其余条目；
+    - cascade 为 true（默认）时，删除全量备份会连带删除其关联的增量备份；
+    - 单条失败不阻断其余条目，最终一次性写回 backup-files.json 并返回逐条明细。
+    """
+    payload = request.get_json(silent=True) or {}
+    raw = payload.get("dirNames")
+    if not isinstance(raw, list) or not raw:
+        return _error("dirNames 无效")
+
+    dir_names: list[str] = []
+    seen: set[str] = set()
+    for x in raw:
+        dn = unquote(str(x or "")).strip()
+        if not dn or dn in seen:
+            continue
+        seen.add(dn)
+        dir_names.append(dn)
+    if not dir_names:
+        return _error("dirNames 无效")
+
+    cascade = _to_bool(payload.get("cascade")) if "cascade" in payload else True
+
+    current_account_id = _get_current_account_id()
+    with _file_lock:
+        items = [_normalize_backup_file(x) for x in _load_backup_files()]
+
+    by_dir_name: dict[str, dict] = {}
+    for x in items:
+        dn = (x.get("dirName") or "").strip()
+        if dn and dn not in by_dir_name:
+            by_dir_name[dn] = x
+
+    targets: list[dict] = []
+    failed: list[dict] = []
+    for dn in dir_names:
+        item = by_dir_name.get(dn)
+        if not item:
+            failed.append({"dirName": dn, "error": "记录不存在"})
+            continue
+        if (item.get("account_id") or "").strip() != (current_account_id or "").strip():
+            # 与单条删除一致，不暴露他人记录是否存在
+            failed.append({"dirName": dn, "error": "记录不存在"})
+            continue
+        targets.append(item)
+
+    # _collect_cascade_increment_items 已排除被显式选中的目录，不会重复删除
+    cascaded_dir_names: list[str] = []
+    if cascade and targets:
+        for inc in _collect_cascade_increment_items(
+            items, targets, current_account_id or ""
+        ):
+            dn = (inc.get("dirName") or "").strip()
+            cascaded_dir_names.append(dn)
+            targets.append(inc)
+
+    deleted, delete_failed = _execute_backup_file_deletions(targets)
+    failed.extend(delete_failed)
+
+    failed_dir_names = {f["dirName"] for f in delete_failed}
+    cascaded_deleted = [d for d in cascaded_dir_names if d not in failed_dir_names]
+
+    if not deleted:
+        # 全部失败：仍返回逐条明细，便于前端展示具体原因
+        return _error(
+            f"未删除任何备份（{len(failed)} 条失败）",
+            http_status=400,
+            data={
+                "deleted": [],
+                "failed": failed,
+                "cascaded": [],
+                "requested": len(dir_names),
+            },
+        )
+
+    if failed:
+        msg = f"已删除 {len(deleted)} 条，{len(failed)} 条失败"
+    else:
+        msg = f"已删除 {len(deleted)} 条备份"
+    if cascaded_deleted:
+        msg += f"（含 {len(cascaded_deleted)} 个关联增量备份）"
+
+    return _success(
+        {
+            "deleted": deleted,
+            "failed": failed,
+            "cascaded": cascaded_deleted,
+            "requested": len(dir_names),
+        },
+        msg,
+    )
 
 
 @app.route("/api/backup-files/<path:dir_name>/tables", methods=["GET"])

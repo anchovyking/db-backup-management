@@ -7,6 +7,7 @@ import type { BackupFilesApi } from '#/api/backup/backup-files';
 
 import {
   computed,
+  h,
   nextTick,
   onBeforeUnmount,
   onMounted,
@@ -30,6 +31,7 @@ import {
 
 import { useVbenVxeGrid } from '#/adapter/vxe-table';
 import {
+  batchDeleteBackupFiles,
   deleteBackupFile,
   downloadBackupArchive,
   getBackupFileLogs,
@@ -43,6 +45,8 @@ import DataRestoreForm from '#/views/backup/components/data-restore-form.vue';
 type RowType = BackupFilesApi.BackupFile;
 
 const allBackupFilesRaw = ref<RowType[]>([]);
+/** 表格中已勾选的行（仅当前页可见行），驱动工具栏「批量删除」按钮的禁用态与数量 */
+const selectedRowKeys = ref<RowType[]>([]);
 
 const backupFormRef = ref<any>();
 const [BackupDataDrawer, backupDrawerApi] = useVbenDrawer({
@@ -458,23 +462,132 @@ function onRestoreSuccess() {
   gridApi.reload();
 }
 
+/** 工具栏「批量删除」按钮文案：有勾选时附带数量 */
+const batchDeleteButtonText = computed(() => {
+  const base = $t('page.backup.backupFilesPage.batchDelete');
+  const count = selectedRowKeys.value.length;
+  return count > 0
+    ? `${base} (${$t('page.backup.backupFilesPage.batchDeleteSelectedCount', [count])})`
+    : base;
+});
+
+/** 选中行关联的增量数量：用于删除前提示级联影响（仅统计当前页可见的全量行） */
+function countLinkedIncrements(rows: RowType[]) {
+  const selectedIds = new Set(
+    rows.map((r) => (r.backup_file_id || '').trim()).filter(Boolean),
+  );
+  return allBackupFilesRaw.value.filter(
+    (x) =>
+      (x.backup_type || 'full') === 'increment' &&
+      selectedIds.has((x.full_backup_file_id || '').trim()),
+  ).length;
+}
+
 function handleDelete(row: RowType) {
+  // 与后端保持一致：删除全量会连带删除其关联增量
+  const linkedCount = countLinkedIncrements([row]);
   Modal.confirm({
     title: $t('page.backup.backupFilesPage.confirmDeleteTitle'),
-    content: $t('page.backup.backupFilesPage.confirmDeleteContent', [
-      row.dirName,
-    ]),
+    content: linkedCount > 0
+      ? $t('page.backup.backupFilesPage.confirmDeleteWithCascadeContent', [
+          row.dirName,
+          linkedCount,
+        ])
+      : $t('page.backup.backupFilesPage.confirmDeleteContent', [row.dirName]),
     async onOk() {
-      await deleteBackupFile(row.dirName);
-      message.success($t('page.backup.backupFilesPage.deleteSuccess'));
+      const res: any = await deleteBackupFile(row.dirName);
+      // 后端消息已包含「并级联删除 N 个关联增量备份」等信息
+      message.success(res?.message || $t('page.backup.backupFilesPage.deleteSuccess'));
       gridApi.reload();
     },
   });
 }
 
+/** 批量删除确认后的实际执行：汇总成功/失败并提示 */
+async function runBatchDelete(dirNames: string[]) {
+  let res: any;
+  try {
+    res = await batchDeleteBackupFiles(dirNames, true);
+  } catch {
+    // 全部失败（HTTP 4xx/5xx）：request 拦截器已弹错误提示，这里仅刷新列表
+    gridApi.reload();
+    return;
+  }
+  const deletedCount = res?.deleted?.length ?? 0;
+  const failed: BackupFilesApi.BackupDeleteItemResult[] = res?.failed ?? [];
+  if (failed.length > 0) {
+    Modal.warning({
+      content: h('div', [
+        h(
+          'p',
+          $t('page.backup.backupFilesPage.batchDeletePartialFailed', [
+            deletedCount,
+            failed.length,
+          ]),
+        ),
+        h(
+          'p',
+          { class: 'font-medium' },
+          $t('page.backup.backupFilesPage.batchDeleteDetailTitle'),
+        ),
+        h(
+          'ul',
+          { class: 'mt-1 max-h-48 list-disc overflow-auto pl-5' },
+          failed.map((f) =>
+            h('li', { key: f.dirName }, `${f.dirName}：${f.error ?? '-'}`),
+          ),
+        ),
+      ]),
+      title: $t('page.backup.backupFilesPage.confirmBatchDeleteTitle'),
+    });
+  } else {
+    message.success(
+      res?.message || $t('page.backup.backupFilesPage.deleteSuccess'),
+    );
+  }
+  // 重新加载会重置勾选状态（见 proxyConfig.ajax.query）
+  gridApi.reload();
+}
+
+function handleBatchDelete() {
+  const dirNames = selectedRowKeys.value
+    .map((r) => (r.dirName || '').trim())
+    .filter(Boolean);
+  if (dirNames.length === 0) {
+    message.warning($t('page.backup.backupFilesPage.batchDeleteNothingSelected'));
+    return;
+  }
+  const linkedCount = countLinkedIncrements(selectedRowKeys.value);
+  Modal.confirm({
+    content: linkedCount > 0
+      ? $t('page.backup.backupFilesPage.confirmBatchDeleteWithCascadeContent', [
+          dirNames.length,
+          linkedCount,
+        ])
+      : $t('page.backup.backupFilesPage.confirmBatchDeleteContent', [
+          dirNames.length,
+        ]),
+    title: $t('page.backup.backupFilesPage.confirmBatchDeleteTitle'),
+    async onOk() {
+      await runBatchDelete(dirNames);
+    },
+  });
+}
+
 const gridOptions: VxeTableGridOptions<RowType> = {
+  checkboxConfig: {
+    highlight: true,
+    labelField: 'dirName',
+  },
   columns: [
     { title: $t('page.backup.backupFilesPage.seq'), type: 'seq', width: 60 },
+    {
+      align: 'left',
+      fixed: 'left',
+      title: $t('page.backup.backupFilesPage.selectColumn'),
+      type: 'checkbox',
+      width: 48,
+    },
     {
       field: 'database',
       title: $t('page.backup.backupFilesPage.databaseName'),
@@ -548,6 +661,8 @@ const gridOptions: VxeTableGridOptions<RowType> = {
         const displayItems = items.filter(
           (x) => (x.backup_type || 'full') === 'full',
         );
+        // 重新查询（刷新/搜索/翻页）后 vxe-table 会清空勾选，同步重置避免按钮计数残留
+        selectedRowKeys.value = [];
         return {
           items: displayItems,
           total: displayItems.length,
@@ -567,8 +682,19 @@ const gridOptions: VxeTableGridOptions<RowType> = {
 
 const [Grid, gridApi] = useVbenVxeGrid({
   formOptions,
+  gridEvents: {
+    // 勾选状态同步到工具栏按钮（按钮禁用态依赖选中数量）
+    checkboxChange: () => syncSelectedRows(),
+    checkboxAll: () => syncSelectedRows(),
+  },
   gridOptions,
 } as any);
+
+/** 同步当前勾选行到 selectedRowKeys（工具栏按钮禁用态 + 批量删除入参） */
+function syncSelectedRows() {
+  selectedRowKeys.value = (gridApi.grid.getCheckboxRecords?.() ??
+    []) as unknown as RowType[];
+}
 
 watch(logsDrawerOpen, (open) => {
   if (!open) {
@@ -862,6 +988,13 @@ onBeforeUnmount(() => {
 
     <Grid :table-title="$t('page.backup.backupFilesPage.gridTableTitle')">
       <template #toolbar-tools>
+        <Button
+          danger
+          :disabled="selectedRowKeys.length === 0"
+          @click="handleBatchDelete"
+        >
+          {{ batchDeleteButtonText }}
+        </Button>
         <Button type="primary" @click="backupDrawerApi.open()">
           {{ $t('page.backup.backupFilesPage.toolbarBackupData') }}
         </Button>

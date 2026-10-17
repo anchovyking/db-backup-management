@@ -61,6 +61,7 @@
       "keywordPlaceholder": "Database name / Directory name / Path",
 
       "seq": "No.",
+      "selectColumn": "Select",
       "databaseName": "Database Name",
       "dirName": "Directory Name",
       "backupTime": "Backup Time",
@@ -85,7 +86,20 @@
       "confirmDeleteTitle": "Confirm Delete",
       "confirmDeleteContent":
         "Are you sure to delete backup “{0}”? It will also delete the parsed backup directory on the server (if the directory doesn't exist, only the record will be deleted).",
+      "confirmDeleteWithCascadeContent":
+        "Are you sure to delete backup “{0}”? It will also delete the parsed backup directory on the server (if the directory doesn't exist, only the record will be deleted), together with its {1} linked incremental backup(s).",
       "deleteSuccess": "Deleted successfully",
+
+      "batchDelete": "Batch Delete",
+      "batchDeleteSelectedCount": "{0} selected",
+      "confirmBatchDeleteTitle": "Confirm Batch Delete",
+      "confirmBatchDeleteContent":
+        "Are you sure to delete the {0} selected backup(s)? It will also delete the parsed backup directories on the server (if a directory doesn't exist, only the record will be deleted).",
+      "confirmBatchDeleteWithCascadeContent":
+        "Are you sure to delete the {0} selected backup(s)? It will also delete the parsed backup directories on the server (if a directory doesn't exist, only the record will be deleted), together with {1} linked incremental backup(s).",
+      "batchDeletePartialFailed": "{0} deleted, {1} failed",
+      "batchDeleteDetailTitle": "The following backups failed to delete",
+      "batchDeleteNothingSelected": "Please select the backups to delete first",
 
       "drawerBackupDataTitle": "Backup Data",
       "drawerRestoreDataTitle": "Data Restore",

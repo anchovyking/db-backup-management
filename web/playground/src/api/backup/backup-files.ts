@@ -49,6 +49,24 @@ export namespace BackupFilesApi {
     view_count: number;
     views: BackupObjectItem[];
   }
+
+  /** 批量删除的单条结果 */
+  export interface BackupDeleteItemResult {
+    dirName: string;
+    error?: string;
+    removed_disk?: boolean;
+    resolved_path?: string;
+  }
+
+  export interface BackupBatchDeleteResult {
+    /** 实际删除成功的条目（含级联删除的增量） */
+    cascaded: string[];
+    deleted: BackupDeleteItemResult[];
+    /** 删除失败的条目；单条失败不影响其余条目 */
+    failed: BackupDeleteItemResult[];
+    /** 去重归一化后的请求条目数 */
+    requested: number;
+  }
 }
 
 async function getBackupFilesList(keyword?: string) {
@@ -59,6 +77,21 @@ async function getBackupFilesList(keyword?: string) {
 
 async function deleteBackupFile(dirName: string) {
   return requestClient.delete(`/backup-files/${encodeURIComponent(dirName)}`);
+}
+
+/**
+ * 批量删除备份记录。
+ * @param dirNames 目录名数组（后端去重归一化）
+ * @param cascade 删除全量备份时是否连带删除其关联增量，默认 true
+ */
+async function batchDeleteBackupFiles(
+  dirNames: string[],
+  cascade = true,
+) {
+  return requestClient.post<BackupFilesApi.BackupBatchDeleteResult>(
+    '/backup-files/batch-delete',
+    { cascade, dirNames },
+  );
 }
 
 /** 下载该条记录 backupDir 目录打包的 tar.gz */
@@ -85,6 +118,7 @@ async function getBackupFileLogs(dirName: string) {
 }
 
 export {
+  batchDeleteBackupFiles,
   deleteBackupFile,
   downloadBackupArchive,
   getBackupFileLogs,

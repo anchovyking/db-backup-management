@@ -421,13 +421,18 @@ backup_data/
 
 ### 备份文件管理
 
-| 接口                                   | 方法   | 描述               |
-| -------------------------------------- | ------ | ------------------ |
-| `/api/backup-files`                    | GET    | 获取备份文件列表   |
-| `/api/backup-files/<dirName>`          | DELETE | 删除备份文件       |
-| `/api/backup-files/<dirName>/download` | GET    | 下载备份文件       |
-| `/api/backup-files/<dirName>/tables`   | GET    | 查看备份文件中的表 |
-| `/api/backup-files/<dirName>/logs`     | GET    | 查看备份文件的日志 |
+| 接口 | 方法 | 描述 |
+| ---- | ---- | ---- |
+| `/api/backup-files` | GET | 获取备份文件列表 |
+| `/api/backup-files` | POST | **批量删除备份文件**（请求体 `dirNames` 数组） |
+| `/api/backup-files/<dirName>` | DELETE | 删除备份文件 |
+| `/api/backup-files/<dirName>/download` | GET | 下载备份文件 |
+| `/api/backup-files/<dirName>/tables` | GET | 查看备份文件中的表 |
+| `/api/backup-files/<dirName>/logs` | GET | 查看备份文件的日志 |
+
+> **级联删除说明**：删除「全量备份」时会**连带删除其关联的增量备份**，避免遗留失去基线的孤立增量。批量删除时该行为由请求体 `cascade` 控制（默认 `true`）。
+>
+> **批量删除为部分成功语义**：单条失败（如目录不在允许路径、磁盘删除出错）不会中断其余条目，响应 `data.failed` 会逐条给出失败原因与目录名。
 
 #### 备份文件管理接口请求案例
 
@@ -445,7 +450,34 @@ backup_data/
      -H "Authorization: Bearer <accessToken>"
    ```
 
-3. **下载备份文件** (`/api/backup-files/<dirName>/download`)
+3. **批量删除备份文件** (`POST /api/backup-files/batch-delete`)
+
+   ```bash
+   curl -X POST http://localhost:8081/api/backup-files/batch-delete \
+     -H "Authorization: Bearer <accessToken>" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "dirNames": ["mall_20260325_230118", "mall_20260324_230118"],
+       "cascade": true
+     }'
+   ```
+
+   响应示例（部分失败时 `failed` 非空，`code` 仍为 0）：
+
+   ```json
+   {
+     "code": 0,
+     "data": {
+       "deleted": [{ "dirName": "mall_20260325_230118", "removed_disk": true }],
+       "failed": [{ "dirName": "mall_20260324_230118", "error": "记录不存在" }],
+       "cascaded": ["mall_20260325_inc_20260325_233000"],
+       "requested": 2
+     },
+     "message": "已删除 2 条，1 条失败（含 1 个关联增量备份）"
+   }
+   ```
+
+4. **下载备份文件** (`/api/backup-files/<dirName>/download`)
 
    ```bash
    curl -X GET http://localhost:8081/api/backup-files/mall_20260325_230118/download \
@@ -453,14 +485,14 @@ backup_data/
      -o backup.tar.gz
    ```
 
-4. **查看备份文件中的表** (`/api/backup-files/<dirName>/tables`)
+5. **查看备份文件中的表** (`/api/backup-files/<dirName>/tables`)
 
    ```bash
    curl -X GET http://localhost:8081/api/backup-files/mall_20260325_230118/tables \
      -H "Authorization: Bearer <accessToken>"
    ```
 
-5. **查看备份文件的日志** (`/api/backup-files/<dirName>/logs`)
+6. **查看备份文件的日志** (`/api/backup-files/<dirName>/logs`)
 
    ```bash
    curl -X GET http://localhost:8081/api/backup-files/mall_20260325_230118/logs \
