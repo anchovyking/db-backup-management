@@ -657,15 +657,19 @@ const gridOptions: VxeTableGridOptions<RowType> = {
     ajax: {
       query: async ({ page }, formValues) => {
         const items = await getBackupFilesList(formValues?.keyword);
+        // 全量仍完整保留：用于「关联增量数量」的级联提示（不受分页影响）
         allBackupFilesRaw.value = items;
-        const displayItems = items.filter(
+        const fullItems = items.filter(
           (x) => (x.backup_type || 'full') === 'full',
         );
+        // 接口一次返回全部记录，这里按当前页切片：让分页器名副其实，
+        // 且「全选」范围 = 当前页，避免批量删除误选到其他页
+        const start = (page.currentPage - 1) * page.pageSize;
         // 重新查询（刷新/搜索/翻页）后 vxe-table 会清空勾选，同步重置避免按钮计数残留
         selectedRowKeys.value = [];
         return {
-          items: displayItems,
-          total: displayItems.length,
+          items: fullItems.slice(start, start + page.pageSize),
+          total: fullItems.length,
           page: page.currentPage,
           pageSize: page.pageSize,
         };
