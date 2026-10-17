@@ -81,6 +81,66 @@ cd db-backup-management
 docker build -t db-backup-management:latest .
 ```
 
+### 构建并推送到私有镜像仓库
+
+仓库根目录提供 `build-push-image.sh`，用于构建镜像并推送到私有仓库（默认 `192.168.0.201:5000/anchovypublic/db-backup-management:latest`）。脚本**只负责构建与推送**，何时拉取/上线由运维决定。
+
+```bash
+./build-push-image.sh                  # 构建并推送 :latest
+./build-push-image.sh --build-only     # 只本地构建，不推送（便于先本地验证）
+./build-push-image.sh --also-tag v1.2.3
+./build-push-image.sh --platform linux/amd64,linux/arm64   # 多架构（需 buildx）
+./build-push-image.sh --no-cache
+./build-push-image.sh --login          # 先 docker login 再推送
+```
+
+可用环境变量（命令行参数优先）：`REGISTRY`、`NAMESPACE`、`IMAGE_NAME`、`TAG`、`PLATFORMS`、`DOCKERFILE`、`EXTRA_TAGS`、`NODE_IMAGE`、`MYDUMPER_IMAGE`。
+
+#### 基础镜像
+
+构建依赖两个基础镜像，可通过 `--build-arg` 覆盖（默认上游公开镜像）：
+
+| 用途 | build-arg | 默认值 |
+|---|---|---|
+| 前端构建 | `NODE_IMAGE` | `node:22-bookworm-slim` |
+| 运行镜像 | `MYDUMPER_IMAGE` | `mydumper/mydumper:v0.21.3-2` |
+
+`build-push-image.sh` 会把两者默认指向本私仓（`<REGISTRY>/<NAMESPACE>/node:22-slim` 与 `.../mydumper:v0.21.3-2`），避免构建时依赖外网。若私仓尚缺这两个镜像，先镜像进来：
+
+```bash
+docker pull mydumper/mydumper:v0.21.3-2
+docker tag  mydumper/mydumper:v0.21.3-2 192.168.0.201:5000/anchovypublic/mydumper:v0.21.3-2
+docker push 192.168.0.201:5000/anchovypublic/mydumper:v0.21.3-2
+
+docker tag  node:22-bookworm-slim 192.168.0.201:5000/anchovypublic/node:22-slim
+docker push 192.168.0.201:5000/anchovypublic/node:22-slim
+```
+
+直接 `docker build` 时也可显式指定：
+
+```bash
+docker build \
+  --build-arg NODE_IMAGE=192.168.0.201:5000/anchovypublic/node:22-slim \
+  --build-arg MYDUMPER_IMAGE=192.168.0.201:5000/anchovypublic/mydumper:v0.21.3-2 \
+  -t db-backup-management:latest .
+```
+
+> **私仓为 HTTP 时**：需把仓库地址加入宿主机 `/etc/docker/daemon.json` 的 `insecure-registries` 并重启 docker，否则 push 会报 HTTPS/HTTP 错误：
+>
+> ```json
+> { "insecure-registries": ["192.168.0.201:5000"] }
+> ```
+>
+> 推送完成后，运维在目标机器执行：
+>
+> ```bash
+> docker pull 192.168.0.201:5000/anchovypublic/db-backup-management:latest
+> docker run -d -p 5555:5555 \
+>   -v "/宿主机/备份目录/backup_data:/app/backup_data" \
+>   --name db-backup \
+>   192.168.0.201:5000/anchovypublic/db-backup-management:latest
+> ```
+
 ## 挂载说明
 
 | 容器路径 | 说明 |

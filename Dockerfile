@@ -11,11 +11,17 @@
 
 # syntax=docker/dockerfile:1
 
+# 基础镜像（默认上游公开镜像），可用 --build-arg 指向私有仓库 / 镜像站，例如：
+#   --build-arg NODE_IMAGE=192.168.0.201:5000/anchovypublic/node:22-slim
+#   --build-arg MYDUMPER_IMAGE=192.168.0.201:5000/anchovypublic/mydumper:v0.21.3-2
+ARG NODE_IMAGE=node:22-bookworm-slim
+ARG MYDUMPER_IMAGE=mydumper/mydumper:v0.21.3-2
+
 # ---------- 阶段 1：在容器内构建 playground（.env.production 中 VITE_GLOB_API_URL=/api） ----------
 # 静态站点与目标 CPU 无关；多架构构建时若在此阶段跑 linux/arm64，会在 QEMU 下执行 pnpm/vite，
 # 极易 OOM 或异常退出。固定用构建机原生平台（Buildx 注入的 BUILDPLATFORM，Actions 上多为 amd64）。
 ARG BUILDPLATFORM
-FROM --platform=$BUILDPLATFORM registry.cn-guangzhou.aliyuncs.com/devyunze/node:22.22-slim AS frontend-builder
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS frontend-builder
 
 ENV TZ=Asia/Shanghai \
     NODE_OPTIONS=--max-old-space-size=8192 \
@@ -58,7 +64,7 @@ RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
 RUN pnpm run build --filter=@vben/playground
 
 # ---------- 阶段 2：运行镜像（mydumper 基础 + nginx + Flask） ----------
-FROM registry.cn-guangzhou.aliyuncs.com/devyunze/mydumper:v0.21.3-2
+FROM ${MYDUMPER_IMAGE}
 
 ENV TZ=Asia/Shanghai \
     PYTHONDONTWRITEBYTECODE=1 \
